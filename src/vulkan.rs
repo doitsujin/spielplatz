@@ -888,9 +888,13 @@ impl Pipeline {
                 .size(push_data_size as u32)
         ];
 
-        let create_info = vk::PipelineLayoutCreateInfo::default()
-            .set_layouts(&set_layouts)
-            .push_constant_ranges(&push_constant_range);
+        let mut create_info = vk::PipelineLayoutCreateInfo::default()
+            .set_layouts(&set_layouts);
+
+        if push_constant_range[0].size > 0 {
+            create_info = create_info
+                .push_constant_ranges(&push_constant_range);
+        }
 
         let vk_pipeline_layout = unsafe {
             vk.create_pipeline_layout(&create_info, None).map_err(
