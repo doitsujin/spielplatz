@@ -2,8 +2,11 @@ use std::cmp;
 use std::collections::{HashMap};
 use std::ffi::{OsString};
 use std::fs;
+use std::io::{BufReader};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc};
+
+use png;
 
 use serde_json as sj;
 
@@ -243,7 +246,7 @@ impl NumericSource {
                 match resource {
                     Binding::Null => Ok(0i64),
                     Binding::Image(i) => {
-                        let (x, y, z) = i.extent(0);
+                        let (x, y, z) = i.info().extent;
                         Ok(component.eval((x as i64, y as i64, z as i64)))
                     },
                     _ => { return Err(format!("Not an image: {name}")); }
@@ -257,7 +260,7 @@ impl NumericSource {
 
                 match resource {
                     Binding::Null => Ok(0i64),
-                    Binding::Image(i) => Ok(i.info().layer_count as i64),
+                    Binding::Image(i) => Ok(i.info().layers as i64),
                     _ => { return Err(format!("Not an image: {name}")); }
                 }
             },
@@ -269,7 +272,7 @@ impl NumericSource {
 
                 match resource {
                     Binding::Null => Ok(0i64),
-                    Binding::Image(i) => Ok(i.info().mip_count as i64),
+                    Binding::Image(i) => Ok(i.info().mips as i64),
                     _ => { return Err(format!("Not an image: {name}")); }
                 }
             },
@@ -755,6 +758,22 @@ trait InputResource {
 }
 
 
+// Null resource
+struct InputNullResource { }
+
+impl InputNullResource {
+    fn new() -> Self {
+        Self { }
+    }
+}
+
+impl InputResource for InputNullResource {
+    fn load(&self, _ : &mut Context, _ : &Shader, _ : &str) -> Result<Binding, String> {
+        Ok(Binding::Null)
+    }
+}
+
+
 // Untyped buffer read from a binary file.
 struct InputBinaryBuffer {
     buffer  : Binding,
@@ -836,6 +855,79 @@ impl InputResource for InputJsonBuffer {
         context.copy_buffer(&gpu_buffer, &cpu_buffer)?;
 
         Ok(Binding::Buffer(gpu_buffer.clone()))
+    }
+}
+
+
+// PNG image resource
+struct InputPngImage {
+    image : Binding,
+}
+
+impl InputPngImage {
+    fn new(path : &Path, context : &mut Context) -> Result<Self, String> {
+        println!("Loading PNG image: {}", path.to_str().unwrap());
+
+        let png_file= fs::File::open(path).map_err(
+            |e| format!("Failed to open PNG file {}: {e}", path.to_str().unwrap()))?;
+
+        let mut png_decoder = png::Decoder::new(BufReader::new(png_file));
+
+        png_decoder.set_transformations(
+            png::Transformations::EXPAND |
+            png::Transformations::ALPHA);
+
+        let mut png_reader = png_decoder.read_info().map_err(
+            |e| format!("Failed to read PNG file {}: {e}", path.to_str().unwrap()))?;
+
+        let png_info = png_reader.info();
+
+        let image_info = Self::image_info_from_png(&png_info)?;
+        let image = Image::new(context, image_info.clone())?;
+
+        let data_size = png_reader.output_buffer_size().ok_or(
+            format!("Failed to query buffer size for {}", path.to_str().unwrap()))?;
+
+        let buffer_info = BufferInfo::default()
+            .size(data_size)
+            .cpu_access(CpuAccess::WRITE);
+
+        for i in 0..image_info.layers {
+            let buffer = Buffer::new(context, buffer_info.clone())?;
+            png_reader.next_frame(&mut buffer.get_mapped_mut().unwrap()).map_err(
+                |e| format!("Failed to read PNG file {}: {e}", path.to_str().unwrap()))?;
+
+            context.copy_buffer_to_image(&image, 0, i, &buffer)?;
+        }
+
+        png_reader.finish().map_err(
+            |e| format!("Failed to read PNG file {}: {e}", path.to_str().unwrap()))?;
+
+        Ok(Self {
+            image : Binding::Image(image)
+        })
+    }
+
+    fn image_info_from_png(info : &png::Info<'_>) -> Result<ImageInfo, String> {
+        let frame_count = info.animation_control.map(|m| m.num_frames).unwrap_or(1);
+
+        let format = match info.bit_depth {
+            png::BitDepth::Eight   => ImageFormat::RGBA8un,
+            png::BitDepth::Sixteen => ImageFormat::RGBA16un,
+            _ => { return Err(format!("Unsupported bit depth: {}", info.bit_depth as u8)) }
+        };
+
+        Ok(ImageInfo::default()
+            .format(format)
+            .mips(1)
+            .layers(frame_count)
+            .dim_2d((info.width, info.height)))
+    }
+}
+
+impl InputResource for InputPngImage {
+    fn load(&self, _ : &mut Context, _ : &Shader, _ : &str) -> Result<Binding, String> {
+        Ok(self.image.clone())
     }
 }
 
@@ -1029,6 +1121,8 @@ impl BatchInstance {
                     Ok(Box::new(InputBinaryBuffer::new(&path, context)?) as Box<dyn InputResource>)
                 } else if path_ext == "json" {
                     Ok(Box::new(InputJsonBuffer::new(&path)?) as Box<dyn InputResource>)
+                } else if path_ext == "png" {
+                    Ok(Box::new(InputPngImage::new(&path, context)?) as Box<dyn InputResource>)
                 } else {
                     Err(format!("Unrecognized file extension: {}", path.to_str().unwrap()))
                 }

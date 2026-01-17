@@ -1,7 +1,9 @@
 use std::collections::{HashMap};
+use std::cell::{RefCell};
 use std::cmp;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
+use std::ops::{Deref, DerefMut};
 use std::ptr;
 use std::rc::{Rc};
 use std::slice;
@@ -36,7 +38,7 @@ fn make_cstring_from_vk<const N : usize>(s : &[c_char; N]) -> CString {
 pub enum Binding {
     Null,
     Buffer(Rc<Buffer>),
-    Image(Rc<ImageView>),
+    Image(Rc<Image>),
     Sampler(Rc<Sampler>),
 }
 
@@ -962,6 +964,49 @@ impl BufferInfo {
 }
 
 
+// Guard around mapped memory region. Will flush mapped range once dropped.
+pub struct BufferRegion<'a> {
+    buffer : &'a Buffer,
+}
+
+impl<'a> BufferRegion<'a> {
+    fn new(buffer : &'a Buffer) -> Option<Self> {
+        if !buffer.info.cpu_access.contains(CpuAccess::WRITE) {
+            return None;
+        }
+
+        buffer.invalidate_mapped_range(0, buffer.info.size);
+        Some(Self { buffer : buffer })
+    }
+}
+
+impl Deref for BufferRegion<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        unsafe {
+            let ptr = self.buffer.map_ptr.cast::<u8>();
+            slice::from_raw_parts(ptr, self.buffer.info.size)
+        }
+    }
+}
+
+impl DerefMut for BufferRegion<'_> {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        unsafe {
+            let ptr = self.buffer.map_ptr.cast::<u8>();
+            slice::from_raw_parts_mut(ptr, self.buffer.info.size)
+        }
+    }
+}
+
+impl Drop for BufferRegion<'_> {
+    fn drop(&mut self) {
+        self.buffer.flush_mapped_range(0, self.buffer.info.size);
+    }
+}
+
+
 // Vulkan buffer
 pub struct Buffer {
     device      : Rc<VulkanDevice>,
@@ -1067,6 +1112,11 @@ impl Buffer {
         }
     }
 
+    // Retrieves mutable mapped slice
+    pub fn get_mapped_mut<'a>(&'a self) -> Option<BufferRegion<'a>> {
+        BufferRegion::new(self)
+    }
+
     // Writes raw bytes to mapped memory region
     pub fn write_bytes(&self, offset : usize, data : &[u8]) {
         let size = data.len();
@@ -1158,96 +1208,6 @@ impl Drop for Buffer {
 impl Trackable for Buffer { }
 
 
-// Vulkan image view parameters
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ImageViewInfo {
-    pub dim           : ImageDim,
-    pub format        : ImageFormat,
-    pub mip_index     : u32,
-    pub mip_count     : u32,
-    pub layer_index   : u32,
-    pub layer_count   : u32,
-}
-
-
-// Vulkan image view
-#[derive(Clone)]
-pub struct ImageView {
-    image   : Rc<Image>,
-    info    : ImageViewInfo,
-    vk_view : vk::ImageView,
-}
-
-impl ImageView {
-    fn new(image : Rc<Image>, info : &ImageViewInfo) -> Result<Rc<Self>, String> {
-        let vk = image.device.get();
-
-        if info.layer_index + info.layer_count > image.info.layers {
-            return Err(format!("Array layer range [{}..{}] out of bounds: {}",
-                info.layer_index, info.layer_index + info.layer_count, image.info.layers));
-        }
-
-        if info.mip_index + info.mip_count > image.info.mips {
-            return Err(format!("Mip level range [{}..{}] out of bounds: {}",
-                info.mip_index, info.mip_index + info.mip_count, image.info.mips));
-        }
-
-        let subresources = vk::ImageSubresourceRange::default()
-            .aspect_mask(vk::ImageAspectFlags::COLOR)
-            .base_array_layer(info.layer_index)
-            .layer_count(info.layer_count)
-            .base_mip_level(info.mip_index)
-            .level_count(info.mip_count);
-
-        let create_info = vk::ImageViewCreateInfo::default()
-            .image(image.vk_image)
-            .view_type(info.dim.into())
-            .format(info.format.into())
-            .subresource_range(subresources);
-
-        let vk_view = unsafe {
-            vk.create_image_view(&create_info, None).map_err(
-                |e| format!("Failed to create image view: {}", e.to_string()))?
-        };
-
-        Ok(Rc::new(Self {
-            image   : image,
-            info    : info.clone(),
-            vk_view : vk_view,
-        }))
-    }
-
-    // Queries extent of a given mip level
-    pub fn extent(&self, mip : u32) -> (u32, u32, u32) {
-        let (x, y, z) = self.image.info().extent;
-        let shift = self.info.mip_index + mip;
-
-        (
-            cmp::max(1, x >> shift),
-            cmp::max(1, y >> shift),
-            cmp::max(1, z >> shift),
-        )
-    }
-
-    // Queries view properties
-    pub fn info<'a>(&'a self) -> &'a ImageViewInfo {
-        &self.info
-    }
-}
-
-impl Drop for ImageView {
-    fn drop(&mut self) {
-        let vk = self.image.device.get();
-
-        unsafe {
-            vk.destroy_image_view(self.vk_view, None);
-        }
-    }
-}
-
-impl Trackable for ImageView { }
-
-
 // Vulkan image parameters
 #[derive(Debug, Clone)]
 pub struct ImageInfo {
@@ -1318,12 +1278,118 @@ impl Default for ImageInfo {
 }
 
 
+// View parameters
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ImageViewInfo {
+    dim               : ImageDim,
+    format            : ImageFormat,
+    mip_index         : u32,
+    mip_count         : u32,
+    layer_index       : u32,
+    layer_count       : u32,
+    usage             : vk::ImageUsageFlags,
+}
+
+impl ImageViewInfo {
+    fn from_image(image : &Image, resource_type : &ResourceType) -> Result<Self, String> {
+        let dim = match resource_type {
+            ResourceType::StorageImage(dim, _) |
+            ResourceType::SampledImage(dim) => *dim,
+            _ => { return Err(format!("Invalid view type for image view: {:?}", resource_type)) }
+        };
+
+        let vk_usage = match resource_type {
+            ResourceType::StorageImage(dim, _) => vk::ImageUsageFlags::STORAGE,
+            _ => vk::ImageUsageFlags::SAMPLED,
+        };
+
+        let mip_count = match resource_type {
+            ResourceType::StorageImage(_, _) => 1,
+            _ => image.info.mips
+        };
+
+        let layer_count = match dim {
+            ImageDim::Dim1D |
+            ImageDim::Dim2D |
+            ImageDim::Dim2DMS |
+            ImageDim::Dim3D |
+            ImageDim::DimCube => 1u32,
+
+            ImageDim::Dim1DArray |
+            ImageDim::Dim2DArray |
+            ImageDim::Dim2DMSArray |
+            ImageDim::DimCubeArray => image.info.layers,
+        };
+
+        Ok(Self {
+            dim     : dim,
+            format  : image.info.format,
+            mip_index   : 0,
+            mip_count   : mip_count,
+            layer_index : 0,
+            layer_count : layer_count,
+            usage       : vk_usage,
+        })
+    }
+}
+
+struct ImageView {
+    device            : Rc<VulkanDevice>,
+    view              : vk::ImageView,
+}
+
+impl ImageView {
+    fn new(device : &Rc<VulkanDevice>, image : &Image, info : &ImageViewInfo) -> Result<ImageView, String> {
+        let subresources = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_array_layer(info.layer_index)
+            .layer_count(info.layer_count)
+            .base_mip_level(info.mip_index)
+            .level_count(info.mip_count);
+
+        let create_info = vk::ImageViewCreateInfo::default()
+            .image(image.vk_image)
+            .view_type(info.dim.into())
+            .format(image.info.format.into())
+            .subresource_range(subresources);
+
+        let vk = device.get();
+
+        let vk_view = unsafe {
+            vk.create_image_view(&create_info, None).map_err(
+                |e| format!("Failed to create image view: {}", e.to_string()))?
+        };
+
+        let view = Self {
+            device      : device.clone(),
+            view        : vk_view,
+        };
+
+        Ok(view)
+    }
+
+    fn get(&self) -> vk::ImageView {
+        self.view
+    }
+}
+
+impl Drop for ImageView {
+    fn drop(&mut self) {
+        let vk = self.device.get();
+
+        unsafe {
+            vk.destroy_image_view(self.view, None);
+        }
+    }
+}
+
 // Vulkan image
 pub struct Image {
     device            : Rc<VulkanDevice>,
     info              : ImageInfo,
     vk_image          : vk::Image,
     vk_memory         : vk::DeviceMemory,
+    views             : RefCell<HashMap<ImageViewInfo, ImageView>>,
 }
 
 impl Image {
@@ -1390,7 +1456,20 @@ impl Image {
             info      : info,
             vk_image  : vk_image,
             vk_memory : vk_memory,
+            views     : RefCell::new(HashMap::new()),
         }))
+    }
+
+    pub fn create_view<'a>(&'a self, ty : &ResourceType) -> Result<vk::ImageView, String> {
+        let mut view_map = self.views.borrow_mut();
+        let view_info = ImageViewInfo::from_image(self, ty)?;
+
+        if !view_map.contains_key(&view_info) {
+            view_map.insert(view_info.clone(),
+                ImageView::new(&self.device, self, &view_info)?);
+        }
+
+        Ok(view_map.get(&view_info).unwrap().get())
     }
 
     // Queries image properties
@@ -1582,6 +1661,35 @@ impl CommandList {
             vk::AccessFlags2::TRANSFER_WRITE)?;
 
         let vk = self.device.get();
+
+        for region in regions {
+            let subresource_range = vk::ImageSubresourceRange::default()
+                .aspect_mask(region.image_subresource.aspect_mask)
+                .base_array_layer(region.image_subresource.base_array_layer)
+                .layer_count(region.image_subresource.layer_count)
+                .base_mip_level(region.image_subresource.mip_level)
+                .level_count(1);
+
+            let image_barrier = [
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COPY)
+                    .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(dst_image)
+                    .subresource_range(subresource_range)
+            ];
+
+            let dependency_info = vk::DependencyInfo::default()
+                .image_memory_barriers(&image_barrier);
+
+            unsafe {
+                vk.cmd_pipeline_barrier2(cmd, &dependency_info);
+            }
+        }
 
         unsafe {
             vk.cmd_copy_buffer_to_image(cmd, src_buffer, dst_image, vk::ImageLayout::GENERAL, regions);
@@ -2138,7 +2246,7 @@ impl Context {
 
                                     image_info = [
                                         vk::DescriptorImageInfo::default()
-                                            .image_view(v.vk_view)
+                                            .image_view(v.create_view(&binding.resource_type)?)
                                             .image_layout(vk::ImageLayout::GENERAL)
                                     ];
                                 },
