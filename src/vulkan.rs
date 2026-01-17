@@ -1116,38 +1116,6 @@ impl Buffer {
     pub fn get_mapped_mut<'a>(&'a self) -> Option<BufferRegion<'a>> {
         BufferRegion::new(self)
     }
-
-    // Writes raw bytes to mapped memory region
-    pub fn write_bytes(&self, offset : usize, data : &[u8]) {
-        let size = data.len();
-
-        assert!(offset <= self.info.size && size <= self.info.size - offset);
-        assert!(self.info.cpu_access.contains(CpuAccess::WRITE));
-
-        unsafe {
-            // SAFETY: Memory is mapped and writable, and we checked the range.
-            let ptr = self.map_ptr.byte_add(offset).cast::<u8>();
-            ptr::copy(data.as_ptr(), ptr, size);
-        }
-
-        self.flush_mapped_range(offset, size);
-    }
-
-    // Reads raw bytes from mapped memory region
-    pub fn read_bytes(&self, offset : usize, data : &mut [u8]) {
-        let size = data.len();
-
-        assert!(offset <= self.info.size && size <= self.info.size - offset);
-        assert!(self.info.cpu_access.contains(CpuAccess::READ));
-
-        self.invalidate_mapped_range(offset, size);
-
-        unsafe {
-            // SAFETY: Memory is mapped and readable, and we checked the range.
-            let ptr = self.map_ptr.byte_add(offset).cast::<u8>();
-            ptr::copy(ptr, data.as_mut_ptr(), size);
-        }
-    }
 }
 
 impl Buffer {

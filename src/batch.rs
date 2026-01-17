@@ -926,7 +926,8 @@ impl InputBinaryBuffer {
         let cpu_buffer = Buffer::new(context, cpu_buffer_info)?;
         let gpu_buffer = Buffer::new(context, gpu_buffer_info)?;
 
-        cpu_buffer.write_bytes(0, &bin);
+        let mut cpu_slice = cpu_buffer.get_mapped_mut().unwrap();
+        cpu_slice.copy_from_slice(&bin);
 
         context.copy_buffer(&gpu_buffer, &cpu_buffer)?;
 
@@ -980,7 +981,8 @@ impl InputResource for InputJsonBuffer {
         let cpu_buffer = Buffer::new(context, cpu_buffer_info)?;
         let gpu_buffer = Buffer::new(context, gpu_buffer_info)?;
 
-        cpu_buffer.write_bytes(0, &buffer_data);
+        let mut cpu_slice = cpu_buffer.get_mapped_mut().unwrap();
+        cpu_slice.copy_from_slice(&buffer_data);
 
         context.copy_buffer(&gpu_buffer, &cpu_buffer)?;
 
@@ -1216,7 +1218,7 @@ impl OutputResource for OutputPngImage {
         let file = fs::File::create(&self.path).map_err(
             |e| format!("Failed to create PNG file {}: {e}", self.path.to_str().unwrap()))?;
 
-        let mut writer = BufWriter::new(file);
+        let writer = BufWriter::new(file);
 
         let (w, h, _) = self.gpu_resource.info().extent;
         let (color, depth) = self.determine_color_type()?;
