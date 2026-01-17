@@ -1633,6 +1633,48 @@ impl CommandList {
         Ok(())
     }
 
+    // Initializes output image
+    fn init_image(&mut self, image : vk::Image, subresources : &vk::ImageSubresourceRange) -> Result<(), String> {
+        let cmd = self.begin()?;
+
+        let stage_mask = 
+            vk::PipelineStageFlags2::COPY |
+            vk::PipelineStageFlags2::COMPUTE_SHADER;
+
+        let access_mask =
+            vk::AccessFlags2::TRANSFER_READ |
+            vk::AccessFlags2::TRANSFER_WRITE |
+            vk::AccessFlags2::SHADER_SAMPLED_READ |
+            vk::AccessFlags2::SHADER_STORAGE_READ |
+            vk::AccessFlags2::SHADER_STORAGE_WRITE;
+
+        self.emit_barrier(stage_mask, access_mask)?;
+
+        let vk = self.device.get();
+
+        let image_barrier = [
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(stage_mask)
+                .dst_stage_mask(stage_mask)
+                .dst_access_mask(access_mask)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::GENERAL)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresources.clone())
+        ];
+
+        let dependency_info = vk::DependencyInfo::default()
+            .image_memory_barriers(&image_barrier);
+
+        unsafe {
+            vk.cmd_pipeline_barrier2(cmd, &dependency_info);
+        }
+
+        Ok(())
+    }
+
     // Records buffer copy command
     fn copy_buffer(&mut self, dst_buffer : vk::Buffer, src_buffer : vk::Buffer, regions : &[vk::BufferCopy]) -> Result<(), String> {
         let cmd = self.begin()?;
@@ -2069,6 +2111,24 @@ impl Context {
         list.reset(&self.timeline)?;
 
         Ok(sync_point)
+    }
+
+    // Initializes image
+    pub fn init_image(&mut self,
+        dst_image : &Rc<Image>
+    ) -> Result<(), String> {
+        let list = self.get_list();
+
+        list.track(dst_image);
+
+        let subresources = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_array_layer(0)
+            .layer_count(dst_image.info().layers)
+            .base_mip_level(0)
+            .level_count(dst_image.info().mips);
+
+        list.init_image(dst_image.vk_image, &subresources)
     }
 
     // Copies buffer data

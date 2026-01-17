@@ -461,11 +461,137 @@ impl OutputBuffer {
 }
 
 
+#[derive(Debug, Clone)]
+struct OutputImage {
+    name        : String,
+    dim         : ImageDim,
+    format      : ImageFormat,
+    extent      : (NumericSource, NumericSource, NumericSource),
+    mips        : NumericSource,
+    layers      : NumericSource,
+}
+
+impl OutputImage {
+    // Parses image info from JSON
+    fn parse(name : String, val : &sj::Value) -> Result<Self, String> {
+        let Some(sj::Value::Number(dim_cnt)) = val.get("dim") else {
+            return Err(format!("Missing dim for image {name}: {val}"));
+        };
+
+        let dim = match dim_cnt.as_i64() {
+            Some(1) => ImageDim::Dim1D,
+            Some(2) => ImageDim::Dim2D,
+            Some(3) => ImageDim::Dim3D,
+            _ => { return Err(format!("Invalid image dimension: {dim_cnt}")) }
+        };
+
+        let x = Self::parse_optional(val.get("width"))?;
+        let y = Self::parse_optional(val.get("height"))?;
+        let z = Self::parse_optional(val.get("depth"))?;
+
+        Ok(Self {
+            name      : name,
+            dim       : dim,
+            format    : Self::parse_format(val.get("format"))?,
+            extent    : (x, y, z),
+            layers    : Self::parse_optional(val.get("layers"))?,
+            mips      : Self::parse_optional(val.get("mips"))?,
+        })
+    }
+
+    fn parse_optional(val : Option<&sj::Value>) -> Result<NumericSource, String> {
+        Ok(val.map(|v| NumericSource::parse(v))
+            .transpose()?
+            .unwrap_or(NumericSource::Constant(1)))
+    }
+
+    fn parse_format(val : Option<&sj::Value>) -> Result<ImageFormat, String> {
+        let formats = [
+            ("R8un", ImageFormat::R8un),
+            ("R8sn", ImageFormat::R8sn),
+            ("R8ui", ImageFormat::R8ui),
+            ("R8si", ImageFormat::R8si),
+            ("RG8un", ImageFormat::RG8un),
+            ("RG8sn", ImageFormat::RG8sn),
+            ("RG8ui", ImageFormat::RG8ui),
+            ("RG8si", ImageFormat::RG8si),
+            ("RGBA8un", ImageFormat::RGBA8un),
+            ("RGBA8sn", ImageFormat::RGBA8sn),
+            ("RGBA8ui", ImageFormat::RGBA8ui),
+            ("RGBA8si", ImageFormat::RGBA8si),
+            ("RGB9E5f", ImageFormat::RGB9E5f),
+            ("RGB10A2ui", ImageFormat::RGB10A2ui),
+            ("RGB10A2un", ImageFormat::RGB10A2un),
+            ("RGB10A2si", ImageFormat::RGB10A2si),
+            ("RGB10A2sn", ImageFormat::RGB10A2sn),
+            ("R11G11B10f", ImageFormat::R11G11B10f),
+            ("R16un", ImageFormat::R16un),
+            ("R16sn", ImageFormat::R16sn),
+            ("R16ui", ImageFormat::R16ui),
+            ("R16si", ImageFormat::R16si),
+            ("R16f", ImageFormat::R16f),
+            ("RG16un", ImageFormat::RG16un),
+            ("RG16sn", ImageFormat::RG16sn),
+            ("RG16ui", ImageFormat::RG16ui),
+            ("RG16si", ImageFormat::RG16si),
+            ("RG16f", ImageFormat::RG16f),
+            ("RGBA16un", ImageFormat::RGBA16un),
+            ("RGBA16sn", ImageFormat::RGBA16sn),
+            ("RGBA16ui", ImageFormat::RGBA16ui),
+            ("RGBA16si", ImageFormat::RGBA16si),
+            ("RGBA16f", ImageFormat::RGBA16f),
+            ("R32ui", ImageFormat::R32ui),
+            ("R32si", ImageFormat::R32si),
+            ("R32f", ImageFormat::R32f),
+            ("RG32ui", ImageFormat::RG32ui),
+            ("RG32si", ImageFormat::RG32si),
+            ("RG32f", ImageFormat::RG32f),
+            ("RGBA32ui", ImageFormat::RGBA32ui),
+            ("RGBA32si", ImageFormat::RGBA32si),
+            ("R64ui", ImageFormat::R64ui),
+            ("R64si", ImageFormat::R64si),
+        ];
+
+        let Some(sj::Value::String(fmt)) = val else {
+            return Err(format!("Invalid format string: {:?}", val));
+        };
+
+        for (s, f) in formats {
+            if s == fmt {
+                return Ok(f);
+            }
+        }
+
+        Err(format!("Unknown format: {fmt}"))
+    }
+
+    // Evaluates output info to image description
+    fn eval(&self,
+        shader    : &Shader,
+        resources : &HashMap<String, Binding>
+    ) -> Result<ImageInfo, String> {
+        let (x_src, y_src, z_src) = &self.extent;
+
+        let x = x_src.eval(shader, resources)? as u32;
+        let y = y_src.eval(shader, resources)? as u32;
+        let z = z_src.eval(shader, resources)? as u32;
+
+        Ok(ImageInfo::default()
+            .dim(self.dim)
+            .extent((x, y, z))
+            .mips(self.mips.eval(shader, resources)? as u32)
+            .layers(self.layers.eval(shader, resources)? as u32)
+            .format(self.format))
+    }
+}
+
+
 // Output resource description. Used to determine properties such
 // as the size of a buffer or image based on shader inputs.
 #[derive(Debug, Clone)]
 enum OutputResourceInfo {
     Buffer(OutputBuffer),
+    Image(OutputImage),
 }
 
 impl OutputResourceInfo {
@@ -476,6 +602,10 @@ impl OutputResourceInfo {
 
         if let Some(buffer) = val.get("buffer") {
             return Ok((name.clone(), Self::Buffer(OutputBuffer::parse(name.clone(), buffer)?)));
+        }
+
+        if let Some(image) = val.get("image") {
+            return Ok((name.clone(), Self::Image(OutputImage::parse(name.clone(), image)?)));
         }
 
         return Err(format!("No 'buffer' or 'image' in resource description {name}: {val}"))
@@ -694,7 +824,7 @@ impl BatchFile {
 
     pub fn parse_file(filename : &Path) -> Result<Self, String> {
         let json_string = fs::read_to_string(filename).map_err(
-            |e| format!("Failed to open JSON file: {}", filename.display()))?;
+            |e| format!("Failed to open JSON file {}: {e}", filename.display()))?;
         
         let json : sj::Value = sj::from_str(&json_string).map_err(
             |e| format!("Failed to parse JSON file {}: {e}", filename.display()))?;
@@ -1255,6 +1385,14 @@ impl BatchInstance {
                 let buffer = Buffer::new(context, buf_info)?;
 
                 Ok(Binding::Buffer(buffer))
+            },
+
+            OutputResourceInfo::Image(info) => {
+                let img_info = info.eval(shader, resources)?;
+                let image = Image::new(context, img_info)?;
+                context.init_image(&image)?;
+
+                Ok(Binding::Image(image))
             },
         }
     }
