@@ -463,7 +463,6 @@ impl OutputBuffer {
 
 #[derive(Debug, Clone)]
 struct OutputImage {
-    name        : String,
     dim         : ImageDim,
     format      : ImageFormat,
     extent      : (NumericSource, NumericSource, NumericSource),
@@ -490,7 +489,6 @@ impl OutputImage {
         let z = Self::parse_optional(val.get("depth"))?;
 
         Ok(Self {
-            name      : name,
             dim       : dim,
             format    : Self::parse_format(val.get("format"))?,
             extent    : (x, y, z),

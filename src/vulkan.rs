@@ -274,7 +274,7 @@ struct Properties {
 
 // Reference-counted SDL subsystem
 struct SdlInstance {
-    instance    : sdl3::Sdl,
+    _instance   : sdl3::Sdl,
     video       : sdl3::VideoSubsystem,
     event       : sdl3::EventSubsystem,
     event_pump  : sdl3::EventPump,
@@ -299,7 +299,7 @@ impl SdlInstance {
             .map_err(|e| e.to_string())?;
 
         Ok(Self {
-            instance    : instance,
+            _instance   : instance,
             video       : video,
             event       : event,
             event_pump  : event_pump,
@@ -518,8 +518,8 @@ impl Drop for VulkanInstance {
 // Reference-counted Vulkan device
 struct VulkanDevice {
     instance      : Rc<VulkanInstance>,
-    properties    : Properties,
-    features      : Features<'static>,
+    _properties    : Properties,
+    _features      : Features<'static>,
     memory        : vk::PhysicalDeviceMemoryProperties,
     queue_family  : u32,
     vk_device     : ash::Device,
@@ -736,8 +736,8 @@ impl VulkanDevice {
 
         Ok(Self {
             instance      : instance.clone(),
-            features      : features,
-            properties    : properties,
+            _features     : features,
+            _properties   : properties,
             memory        : memory,
             queue_family  : queue_index,
             vk_device     : vk_device,
