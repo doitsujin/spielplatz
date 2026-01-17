@@ -1220,16 +1220,8 @@ pub struct ImageInfo {
 }
 
 impl ImageInfo {
-    pub fn dim_1d(self, extent : u32) -> Self {
-        self.dim(ImageDim::Dim1D).extent((extent, 1, 1))
-    }
-
     pub fn dim_2d(self, extent : (u32, u32)) -> Self {
         self.dim(ImageDim::Dim2D).extent((extent.0, extent.1, 1))
-    }
-
-    pub fn dim_3d(self, extent : (u32, u32, u32)) -> Self {
-        self.dim(ImageDim::Dim3D).extent(extent)
     }
 
     pub fn dim(mut self, dim : ImageDim) -> Self {
@@ -1245,12 +1237,6 @@ impl ImageInfo {
     pub fn mips(mut self, mips : u32) -> Self {
         self.mips = mips;
         self
-    }
-
-    pub fn mips_max(self) -> Self {
-        let (x, y, z) = self.extent;
-        let max_extent = cmp::max(cmp::max(x, y), z);
-        self.mips((max_extent * 2).checked_ilog2().unwrap_or(0))
     }
 
     pub fn layers(mut self, layers : u32) -> Self {
@@ -1299,7 +1285,7 @@ impl ImageViewInfo {
         };
 
         let vk_usage = match resource_type {
-            ResourceType::StorageImage(dim, _) => vk::ImageUsageFlags::STORAGE,
+            ResourceType::StorageImage(_, _) => vk::ImageUsageFlags::STORAGE,
             _ => vk::ImageUsageFlags::SAMPLED,
         };
 
@@ -1787,8 +1773,6 @@ impl CommandList {
 
     // Sets push data for the given compute pipeline
     fn set_push_data(&mut self, pipeline : &Pipeline, data : &[u8]) -> Result<(), String> {
-        let cmd = self.begin()?;
-
         let push_data_size = pipeline.shader.push_constants()
             .map(|p| p.size()).unwrap_or(0);
 
@@ -2297,8 +2281,8 @@ impl Context {
                             descriptor_write.image_info(&image_info)
                         },
 
-                        ResourceType::SampledImage(dim) |
-                        ResourceType::StorageImage(dim, _) => {
+                        ResourceType::SampledImage(_) |
+                        ResourceType::StorageImage(_, _) => {
                             match resource {
                                 Binding::Null => { },
                                 Binding::Image(v) => {

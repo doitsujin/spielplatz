@@ -72,6 +72,61 @@ pub enum ImageFormat {
     R64si,
 }
 
+impl ImageFormat {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            Self::R8ui |
+            Self::R8si |
+            Self::R8un |
+            Self::R8sn => 1usize,
+
+            Self::RG8ui |
+            Self::RG8si |
+            Self::RG8un |
+            Self::RG8sn |
+            Self::R16ui |
+            Self::R16si |
+            Self::R16un |
+            Self::R16sn |
+            Self::R16f => 2usize,
+
+            Self::RGBA8ui |
+            Self::RGBA8si |
+            Self::RGBA8un |
+            Self::RGBA8sn |
+            Self::RGB9E5f |
+            Self::RGB10A2ui |
+            Self::RGB10A2si |
+            Self::RGB10A2un |
+            Self::RGB10A2sn |
+            Self::R11G11B10f |
+            Self::RG16ui |
+            Self::RG16si |
+            Self::RG16un |
+            Self::RG16sn |
+            Self::RG16f |
+            Self::R32ui |
+            Self::R32si |
+            Self::R32f => 4usize,
+
+            Self::RGBA16ui |
+            Self::RGBA16si |
+            Self::RGBA16un |
+            Self::RGBA16sn |
+            Self::RGBA16f |
+            Self::RG32ui |
+            Self::RG32si |
+            Self::RG32f |
+            Self::R64ui |
+            Self::R64si => 8usize,
+
+            Self::RGBA32ui |
+            Self::RGBA32si |
+            Self::RGBA32f => 16usize,
+        }
+    }
+}
+
 
 // Set and binding index for a shader resource
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

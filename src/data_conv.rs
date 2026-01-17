@@ -248,7 +248,7 @@ fn from_json_struct(dst : &mut [u8], j : &sj::Value, ty : &StructType) -> Result
     Ok(())
 }
 
-fn from_json_pointer(dst : &mut [u8], j : &sj::Value) -> Result<(), String> {
+fn from_json_pointer(_ : &mut [u8], j : &sj::Value) -> Result<(), String> {
     match j {
         sj::Value::String(_) => Ok(()),
         _ => Err("Expected String for pointer type".to_string()),

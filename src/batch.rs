@@ -2,7 +2,7 @@ use std::cmp;
 use std::collections::{HashMap};
 use std::ffi::{OsString};
 use std::fs;
-use std::io::{BufReader};
+use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::rc::{Rc};
 
@@ -1154,6 +1154,91 @@ impl OutputResource for OutputJsonBuffer {
 }
 
 
+// PNG output image
+struct OutputPngImage {
+    path            : PathBuf,
+    gpu_resource    : Rc<Image>,
+    cpu_resources   : Vec<Rc<Buffer>>,
+}
+
+impl OutputPngImage {
+    fn new(context : &mut Context, resource : &Binding, path : &Path) -> Result<Self, String> {
+        let Binding::Image(gpu_image) = resource.clone() else {
+            return Err(format!("Output resource for {} is not an image", path.to_str().unwrap()));
+        };
+
+        let (w, h, _) = gpu_image.info().extent;
+        let format = gpu_image.info().format;
+        let layers = gpu_image.info().layers;
+
+        let buffer_info = BufferInfo::default()
+            .size(format.byte_size() * (w * h) as usize)
+            .cpu_access(CpuAccess::READ);
+
+        let cpu_buffers = (0..layers).into_iter()
+            .map(|_| Buffer::new(context, buffer_info.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(Self {
+            path          : path.into(),
+            gpu_resource  : gpu_image,
+            cpu_resources : cpu_buffers,
+        })
+    }
+
+    fn determine_color_type(&self) -> Result<(png::ColorType, png::BitDepth), String> {
+        let format = self.gpu_resource.info().format;
+
+        match format {
+            ImageFormat::R8un     => Ok((png::ColorType::Grayscale, png::BitDepth::Eight)),
+            ImageFormat::RG8un    => Ok((png::ColorType::GrayscaleAlpha, png::BitDepth::Eight)),
+            ImageFormat::RGBA8un  => Ok((png::ColorType::Rgba, png::BitDepth::Eight)),
+            ImageFormat::R16un    => Ok((png::ColorType::Grayscale, png::BitDepth::Sixteen)),
+            ImageFormat::RG16un   => Ok((png::ColorType::GrayscaleAlpha, png::BitDepth::Sixteen)),
+            ImageFormat::RGBA16un => Ok((png::ColorType::Rgba, png::BitDepth::Sixteen)),
+            _ => Err(format!("Unsupported format for PNG export: {:?}", format))
+        }
+    }
+}
+
+impl OutputResource for OutputPngImage {
+    fn read_back(&self, context : &mut Context) -> Result<(), String> {
+        for (i, buf) in self.cpu_resources.iter().enumerate() {
+            context.copy_image_to_buffer(buf, &self.gpu_resource, 0, i as u32)?;
+        }
+
+        Ok(())
+    }
+
+    fn save_to_file(&self) -> Result<(), String> {
+        println!("Writing output image: {}", self.path.to_str().unwrap());
+        
+        let file = fs::File::create(&self.path).map_err(
+            |e| format!("Failed to create PNG file {}: {e}", self.path.to_str().unwrap()))?;
+
+        let mut writer = BufWriter::new(file);
+
+        let (w, h, _) = self.gpu_resource.info().extent;
+        let (color, depth) = self.determine_color_type()?;
+
+        let mut png_encoder = png::Encoder::new(writer, w, h);
+        png_encoder.set_color(color);
+        png_encoder.set_depth(depth);
+
+        let mut writer = png_encoder.write_header().map_err(
+            |e| format!("Failed to write PNG header {}: {e}", self.path.to_str().unwrap()))?;
+
+        for buf in self.cpu_resources.iter() {
+            writer.write_image_data(buf.get_mapped().unwrap()).map_err(
+                |e| format!("Failed to write PNG file {}: {e}", self.path.to_str().unwrap()))?;
+        }
+
+        writer.finish().map_err(
+            |e| format!("Failed to write PNG file {}: {e}", self.path.to_str().unwrap()))
+    }
+}
+
+
 // Pass instance, with resource mappings and shader info.
 struct PassInstance {
     pipeline        : Rc<Pipeline>,
@@ -1290,6 +1375,9 @@ impl BatchInstance {
                         format!("Invalid buffer resource: for {}: {name}", path.to_str().unwrap()))?;
 
                     let buf = OutputJsonBuffer::new(context, resource, ty.clone(), &path)?;
+                    Ok(Box::new(buf) as Box<dyn OutputResource>)
+                } else if path_ext == "png" {
+                    let buf = OutputPngImage::new(context, resource, &path)?;
                     Ok(Box::new(buf) as Box<dyn OutputResource>)
                 } else {
                     Err(format!("Unrecognized file extension: {}", path.to_str().unwrap()))

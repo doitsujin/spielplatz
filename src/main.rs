@@ -7,10 +7,7 @@ mod shader;
 mod shader_reflection;
 mod vulkan;
 
-use serde_json as sj;
-
 use batch::*;
-use shader::*;
 use vulkan::*;
 
 fn run_app() -> Result<(), String> {
