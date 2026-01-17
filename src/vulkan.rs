@@ -2,6 +2,7 @@ use std::collections::{HashMap};
 use std::cell::{RefCell};
 use std::cmp;
 use std::ffi::{CStr, CString, c_char, c_void};
+use std::marker::{PhantomData};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -10,7 +11,7 @@ use std::slice;
 
 use bitflags::bitflags;
 
-use ash::{self, ext, khr, vk};
+use ash::{self, ext, khr, vk, vk::Handle};
 use sdl3;
 
 use serde_json as sj;
@@ -278,7 +279,9 @@ struct SdlInstance {
     video       : sdl3::VideoSubsystem,
     event       : sdl3::EventSubsystem,
     event_pump  : sdl3::EventPump,
-    window      : sdl3::video::Window,
+    // yes i know this design is bad but i really don't care
+    // right now, i just want to be able to resize the window
+    window      : RefCell<sdl3::video::Window>,
 }
 
 impl SdlInstance {
@@ -303,7 +306,7 @@ impl SdlInstance {
             video       : video,
             event       : event,
             event_pump  : event_pump,
-            window      : window,
+            window      : RefCell::new(window),
         })
     }
 
@@ -319,21 +322,42 @@ impl SdlInstance {
     }
 
     fn get_vulkan_extensions(&self) -> Result<Vec<CString>, String> {
-        let extensions = self.window.vulkan_instance_extensions().map_err(|e| e.to_string())?;
+        let extensions = self.window.borrow().vulkan_instance_extensions().map_err(|e| e.to_string())?;
 
         Ok(extensions.into_iter().map(
             |ext| CString::new(ext).unwrap()).collect::<Vec<_>>())
+    }
+
+    fn create_vulkan_surface(&self, instance : &ash::Instance) -> Result<vk::SurfaceKHR, String> {
+        unsafe {
+            // SAFETY: We know that both the Vulkan instance and SDL are alive and
+            // well at this point. Need to transmute the different handle types.
+            let ins = instance.handle();
+
+            Ok(mem::transmute(self.window.borrow().vulkan_create_surface(mem::transmute(ins)).map_err(
+                |e| format!("Failed to create Vulkan surface: {e}"))?))
+        }
+    }
+
+    fn get_window_size(&self) -> (u32, u32) {
+        self.window.borrow().size_in_pixels()
+    }
+
+    fn show_window(&self) {
+        self.window.borrow_mut().show();
     }
 }
 
 
 // Reference-counted Vulkan instance
 struct VulkanInstance {
-    _sdl            : SdlInstance,
+    sdl             : SdlInstance,
     _vk_entry       : ash::Entry,
     vk_instance     : ash::Instance,
     ext_debug_utils : Option<ext::debug_utils::Instance>,
+    khr_surface     : khr::surface::Instance,
     vk_messenger    : vk::DebugUtilsMessengerEXT,
+    vk_surface      : vk::SurfaceKHR,
 }
 
 impl VulkanInstance {
@@ -451,12 +475,24 @@ impl VulkanInstance {
             }
         };
 
+        let khr_surface = khr::surface::Instance::new(&vk_entry, &vk_instance);
+
+        let vk_surface = match sdl.create_vulkan_surface(&vk_instance) {
+            Ok(surface) => surface,
+            Err(e) => {
+                eprintln!("Failed to create Vulkan surface: {e}");
+                vk::SurfaceKHR::null()
+            }
+        };
+
         Ok(Self {
-            _sdl            : sdl,
+            sdl             : sdl,
             _vk_entry       : vk_entry,
             vk_instance     : vk_instance,
             ext_debug_utils : ext_debug_utils,
+            khr_surface     : khr_surface,
             vk_messenger    : vk_messenger,
+            vk_surface      : vk_surface,
         })
     }
 
@@ -505,6 +541,8 @@ impl VulkanInstance {
 impl Drop for VulkanInstance {
     fn drop(&mut self) {
         unsafe {
+            self.khr_surface.destroy_surface(self.vk_surface, None);
+
             if let Some(ext_debug_utils) = self.ext_debug_utils.take() {
                 ext_debug_utils.destroy_debug_utils_messenger(self.vk_messenger, None);
             }
@@ -517,9 +555,10 @@ impl Drop for VulkanInstance {
 
 // Reference-counted Vulkan device
 struct VulkanDevice {
-    instance      : Rc<VulkanInstance>,
+    instance      : VulkanInstance,
     _properties    : Properties,
     _features      : Features<'static>,
+    adapter       : vk::PhysicalDevice,
     memory        : vk::PhysicalDeviceMemoryProperties,
     queue_family  : u32,
     vk_device     : ash::Device,
@@ -527,7 +566,7 @@ struct VulkanDevice {
 }
 
 impl VulkanDevice {
-    fn new(instance : &Rc<VulkanInstance>, info : &VulkanInfo) -> Result<Self, String> {
+    fn new(instance : VulkanInstance, info : &VulkanInfo) -> Result<Self, String> {
         let vk = instance.get();
 
         let adapters = unsafe {
@@ -697,14 +736,13 @@ impl VulkanDevice {
 
         let extension_names = extensions.get_names();
 
-        // Pick first available queue, this is probably going to
-        // be a graphics queue but that is fine.
+        // Pick a graphics queue so we can actually present with a blit.
         let queue_properties = unsafe {
             vk.get_physical_device_queue_family_properties(adapter)
         };
 
         let queue_index = queue_properties.iter().enumerate()
-            .filter(|(_, p)| p.queue_flags.contains(vk::QueueFlags::COMPUTE))
+            .filter(|(_, p)| p.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE))
             .map(|(index, _)| index as u32)
             .next()
             .ok_or("No compute-capable queue found".to_string())?;
@@ -735,9 +773,10 @@ impl VulkanDevice {
             &properties.core.properties.device_name));
 
         Ok(Self {
-            instance      : instance.clone(),
+            instance      : instance,
             _features     : features,
             _properties   : properties,
+            adapter       : adapter,
             memory        : memory,
             queue_family  : queue_index,
             vk_device     : vk_device,
@@ -770,6 +809,230 @@ impl Drop for VulkanDevice{
     fn drop(&mut self) {
         unsafe {
             self.vk_device.destroy_device(None);
+        }
+    }
+}
+
+
+// Swapchain semaphore
+struct VulkanSwapchainSync {
+    device  : Rc<VulkanDevice>,
+    acquire : vk::Semaphore,
+    present : vk::Semaphore,
+}
+
+impl VulkanSwapchainSync {
+    fn new(device : &Rc<VulkanDevice>) -> Result<Self, String> {
+        let vk = device.get();
+
+        let create_info = vk::SemaphoreCreateInfo::default();
+
+        let a = unsafe {
+            vk.create_semaphore(&create_info, None).map_err(
+                |e| format!("Failed to create semaphore: {e}"))?
+        };
+
+        let b = unsafe {
+            vk.create_semaphore(&create_info, None).map_err(|e| {
+                vk.destroy_semaphore(a, None);
+                format!("Failed to create semaphore: {e}")
+            })?
+        };
+
+        Ok(Self {
+            device  : device.clone(),
+            acquire : a,
+            present : b,
+        })
+    }
+}
+
+impl Drop for VulkanSwapchainSync {
+    fn drop(&mut self) {
+        let vk = self.device.get();
+
+        unsafe {
+            vk.destroy_semaphore(self.acquire, None);
+            vk.destroy_semaphore(self.present, None);
+        }
+    }
+}
+
+// Acquired swapchain image and sync objects
+struct VulkanSwapImage {
+    vk_swapchain  : vk::SwapchainKHR,
+    vk_image      : vk::Image,
+    image_index   : u32,
+    image_extent  : (u32, u32),
+    sync_acquire  : vk::Semaphore,
+    sync_present  : vk::Semaphore,
+}
+
+// Vulkan swapchain
+struct VulkanSwapchain {
+    device          : Rc<VulkanDevice>,
+    khr_swapchain   : khr::swapchain::Device,
+    vk_swapchain    : vk::SwapchainKHR,
+    vk_images       : Vec<vk::Image>,
+    extent          : (u32, u32),
+
+    sync_objects    : Vec<VulkanSwapchainSync>,
+    sync_index      : usize,
+
+    acquired_image  : Option<VulkanSwapImage>,
+}
+
+impl VulkanSwapchain {
+    fn new(device : &Rc<VulkanDevice>) -> Result<Self, String> {
+        let instance = &device.instance;
+
+        let khr_surface = &instance.khr_surface;
+        let khr_swapchain = khr::swapchain::Device::new(
+            instance.get(), device.get());
+
+        let mut result = Self {
+            device          : device.clone(),
+            khr_swapchain   : khr_swapchain,
+            vk_swapchain    : vk::SwapchainKHR::null(),
+            vk_images       : vec![],
+            extent          : (0, 0),
+            sync_objects    : vec![],
+            sync_index      : 0,
+            acquired_image  : None,
+        };
+
+        let surface_caps = unsafe {
+            khr_surface.get_physical_device_surface_capabilities(device.adapter, instance.vk_surface).map_err(
+                |e| format!("Failed to query surface capabilities: {e}"))?
+        };
+
+        let mut extent = (
+            surface_caps.current_extent.width,
+            surface_caps.current_extent.height);
+
+        if cmp::max(extent.0, extent.1) == u32::MAX {
+            let (w, h) = instance.sdl.get_window_size();
+
+            extent = (
+                cmp::max(cmp::min(w, surface_caps.max_image_extent.width), surface_caps.min_image_extent.width),
+                cmp::max(cmp::min(h, surface_caps.max_image_extent.height), surface_caps.min_image_extent.height));
+        }
+
+        if cmp::min(extent.0, extent.1) == 0 {
+            eprintln!("Surface has size of 0, skipping swapchain.");
+            return Ok(result);
+        }
+
+        // Also don't bother if we can't blit
+        if !surface_caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_DST) {
+            eprintln!("Swapchain does not support TRANSFER_DST usage, skipping swapchain.");
+            return Ok(result);
+        }
+
+        // Pick some random surface format that's sRGB
+        let surface_formats = unsafe {
+            khr_surface.get_physical_device_surface_formats(device.adapter, instance.vk_surface).map_err(
+                |e| format!("Failed to query surface formats: {e}"))?
+        };
+
+        let format = surface_formats.iter()
+            .filter(|f| f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR)
+            .next()
+            .or(surface_formats.first())
+            .ok_or("No suitable surface format found.")?;
+
+        let create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(instance.vk_surface)
+            .min_image_count(surface_caps.min_image_count + 1)
+            .image_format(format.format)
+            .image_color_space(format.color_space)
+            .image_extent(vk::Extent2D::default().width(extent.0).height(extent.1))
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::TRANSFER_DST)
+            .present_mode(vk::PresentModeKHR::FIFO)
+            .pre_transform(vk::SurfaceTransformFlagsKHR::IDENTITY)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .clipped(true);
+
+        result.vk_swapchain = unsafe {
+            result.khr_swapchain.create_swapchain(&create_info, None).map_err(
+                |e| format!("Failed to create swapchain: {e}"))?
+        };
+
+        result.vk_images = unsafe {
+            result.khr_swapchain.get_swapchain_images(result.vk_swapchain).map_err(
+                |e| format!("Failed to query swapchain images: {e}"))?
+        };
+
+        result.extent = extent;
+
+        let sync_object_count = result.vk_images.len() * 2;
+
+        result.sync_objects = (0..sync_object_count).into_iter()
+            .map(|_| VulkanSwapchainSync::new(device))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(result)
+    }
+
+    fn acquire<'a>(&'a mut self) -> Result<&'a VulkanSwapImage, String> {
+        let sync = &self.sync_objects[self.sync_index];
+        self.sync_index = (self.sync_index + 1) % self.sync_objects.len();
+
+        let (vk_image_index, is_suboptimal) = unsafe {
+            self.khr_swapchain.acquire_next_image(self.vk_swapchain,
+                u64::MAX, sync.acquire, vk::Fence::null()).map_err(
+                    |e| format!("Failed to acquire swapchain image: {e}"))?
+        };
+
+        if is_suboptimal {
+            return Err("Suboptimal image".to_string());
+        }
+
+        self.acquired_image = Some(VulkanSwapImage {
+            vk_swapchain  : self.vk_swapchain,
+            vk_image      : self.vk_images[vk_image_index as usize],
+            image_index   : vk_image_index,
+            image_extent  : self.extent,
+            sync_acquire  : sync.acquire,
+            sync_present  : sync.present,
+        });
+
+        Ok(self.acquired_image.as_ref().unwrap())
+    }
+
+    fn present<'a>(&'a mut self) -> Result<(), String> {
+        let image = self.acquired_image.take().ok_or(
+            "No image acquired".to_string())?;
+
+        let present_sem = [image.sync_present];
+        let present_swapchain = [image.vk_swapchain];
+        let present_image = [image.image_index];
+
+        let present_info = vk::PresentInfoKHR::default()
+            .wait_semaphores(&present_sem)
+            .swapchains(&present_swapchain)
+            .image_indices(&present_image);
+
+        unsafe {
+            self.khr_swapchain.queue_present(self.device.vk_queue, &present_info).map_err(
+                |e| format!("Failed to present swapchain image: {e}"))?;
+        }
+
+        Ok(())
+    }
+}
+
+impl Drop for VulkanSwapchain {
+    fn drop(&mut self) {
+        let vk = self.device.get();
+
+        unsafe {
+            if let Err(e) = vk.device_wait_idle() {
+                eprintln!("Failed to wait for device idle: {e}");
+            }
+
+            self.khr_swapchain.destroy_swapchain(self.vk_swapchain, None);
         }
     }
 }
@@ -1478,6 +1741,9 @@ pub struct CommandListState {
 
     sync_stages : vk::PipelineStageFlags2,
     sync_access : vk::AccessFlags2,
+
+    sem_wait    : vk::Semaphore,
+    sem_signal  : vk::Semaphore,
 }
 
 impl CommandListState {
@@ -1486,6 +1752,8 @@ impl CommandListState {
             is_begun    : false,
             sync_stages : vk::PipelineStageFlags2::empty(),
             sync_access : vk::AccessFlags2::empty(),
+            sem_wait    : vk::Semaphore::null(),
+            sem_signal  : vk::Semaphore::null(),
         }
     }
 }
@@ -1592,6 +1860,7 @@ impl CommandList {
         let cmd = self.begin()?;
 
         let stage_mask = 
+            vk::PipelineStageFlags2::BLIT |
             vk::PipelineStageFlags2::COPY |
             vk::PipelineStageFlags2::COMPUTE_SHADER;
 
@@ -1624,6 +1893,59 @@ impl CommandList {
 
         unsafe {
             vk.cmd_pipeline_barrier2(cmd, &dependency_info);
+        }
+
+        Ok(())
+    }
+
+    // Prepares image for presentation
+    fn present_image(&mut self, image : vk::Image, subresources : &vk::ImageSubresourceRange) -> Result<(), String> {
+        let cmd = self.begin()?;
+
+        let stage_mask = vk::PipelineStageFlags2::BLIT;
+        let access_mask = vk::AccessFlags2::TRANSFER_WRITE;
+
+        self.emit_barrier(stage_mask, access_mask)?;
+
+        let vk = self.device.get();
+
+        let image_barrier = [
+            vk::ImageMemoryBarrier2::default()
+                .src_stage_mask(stage_mask)
+                .dst_stage_mask(vk::PipelineStageFlags2::ALL_COMMANDS)
+                .dst_access_mask(vk::AccessFlags2::MEMORY_READ)
+                .old_layout(vk::ImageLayout::GENERAL)
+                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .subresource_range(subresources.clone())
+        ];
+
+        let dependency_info = vk::DependencyInfo::default()
+            .image_memory_barriers(&image_barrier);
+
+        unsafe {
+            vk.cmd_pipeline_barrier2(cmd, &dependency_info);
+        }
+
+        Ok(())
+    }
+
+    // Blits image to another
+    pub fn blit_image(&mut self, dst_image : vk::Image, src_image : vk::Image, regions : &[vk::ImageBlit]) -> Result<(), String> {
+        let cmd = self.begin()?;
+
+        self.emit_barrier(
+            vk::PipelineStageFlags2::BLIT,
+            vk::AccessFlags2::TRANSFER_READ |
+            vk::AccessFlags2::TRANSFER_WRITE)?;
+
+        let vk = self.device.get();
+
+        unsafe {
+            vk.cmd_blit_image(cmd, src_image, vk::ImageLayout::GENERAL,
+                dst_image, vk::ImageLayout::GENERAL, regions, vk::Filter::LINEAR);
         }
 
         Ok(())
@@ -1781,15 +2103,24 @@ impl CommandList {
         Ok(())
     }
 
+    // Sets pair of WSI semaphores
+    fn set_sync_semaphores(&mut self, wait : vk::Semaphore, signal : vk::Semaphore) {
+        self.state.sem_wait = wait;
+        self.state.sem_signal = signal;
+    }
+
     // Submits the command buffer to the queue using the
     // given timeline for synchronization purposes.
     fn submit<'a>(&mut self, timeline : &'a Timeline) -> Result<SyncPoint<'a>, String> {
         let cmd = self.begin()?;
 
+        let wait_sem = self.state.sem_wait;
+        let signal_sem = self.state.sem_signal;
+
         self.emit_barrier(
             vk::PipelineStageFlags2::COMPUTE_SHADER |
+            vk::PipelineStageFlags2::BLIT |
             vk::PipelineStageFlags2::COPY |
-            vk::PipelineStageFlags2::CLEAR |
             vk::PipelineStageFlags2::HOST,
             vk::AccessFlags2::UNIFORM_READ |
             vk::AccessFlags2::SHADER_SAMPLED_READ |
@@ -1809,18 +2140,31 @@ impl CommandList {
                 .command_buffer(cmd)
         ];
 
-        let semaphore_info = [
+        let mut wait_info = Vec::<vk::SemaphoreSubmitInfo>::new();
+
+        if !wait_sem.is_null() {
+            wait_info.push(vk::SemaphoreSubmitInfo::default()
+                .semaphore(wait_sem));
+        }
+
+        let mut signal_info = vec![
             vk::SemaphoreSubmitInfo::default()
                 .semaphore(timeline.vk_semaphore)
                 .value(timeline.vk_timeline)
         ];
 
+        if !signal_sem.is_null() {
+            signal_info.push(vk::SemaphoreSubmitInfo::default()
+                .semaphore(signal_sem));
+        }
+
         let submit_info = [
             vk::SubmitInfo2::default()
                 .command_buffer_infos(&command_buffer_info)
-                .signal_semaphore_infos(&semaphore_info)
+                .wait_semaphore_infos(&wait_info)
+                .signal_semaphore_infos(&signal_info)
         ];
-
+        
         let vk = self.device.get();
 
         unsafe {
@@ -2025,12 +2369,14 @@ pub struct Context {
 
     lists       : Vec<CommandList>,
     list_index  : usize,
+    
+    swapchain   : Option<VulkanSwapchain>,
 }
 
 impl Context {
     pub fn new(info : VulkanInfo) -> Result<Self, String> {
-        let instance = Rc::new(VulkanInstance::new(&info)?);
-        let device = Rc::new(VulkanDevice::new(&instance, &info)?);
+        let instance = VulkanInstance::new(&info)?;
+        let device = Rc::new(VulkanDevice::new(instance, &info)?);
         let timeline = Timeline::new(&device)?;
 
         let command_lists = (0..4).into_iter().map(|_| {
@@ -2042,6 +2388,7 @@ impl Context {
             timeline    : timeline,
             lists       : command_lists,
             list_index  : 0,
+            swapchain   : None,
         })
     }
 
@@ -2335,6 +2682,78 @@ impl Context {
         }
 
         list.dispatch(workgroups)
+    }
+
+    // Displays given image on the application window.
+    pub fn display(&mut self, image : &Rc<Image>) -> Result<(), String> {
+        if self.swapchain.is_none() {
+            self.device.instance.sdl.show_window();
+            self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
+        }
+
+        let swap_image = match self.swapchain.as_mut().unwrap().acquire() {
+            Ok(image) => Ok(image),
+            Err(_) => {
+                // Try and recreate swapchain first, then reacquire
+                mem::drop(self.swapchain.take());
+                
+                self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
+                self.swapchain.as_mut().unwrap().acquire()
+            }
+        }?;
+
+        let list = &mut self.lists[self.list_index];
+
+        list.track(image);
+
+        list.set_sync_semaphores(
+            swap_image.sync_acquire,
+            swap_image.sync_present);
+
+        let subresource = vk::ImageSubresourceRange::default()
+            .aspect_mask(vk::ImageAspectFlags::COLOR)
+            .base_array_layer(0)
+            .layer_count(1)
+            .base_mip_level(0)
+            .level_count(1);
+
+        let (src_w, src_h, _) = image.info().extent;
+        let (dst_w, dst_h) = swap_image.image_extent;
+
+        let region = [
+            vk::ImageBlit::default()
+                .src_subresource(vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_array_layer(0)
+                    .layer_count(1)
+                    .mip_level(0))
+                .src_offsets([
+                    vk::Offset3D::default().x(0).y(0).z(0),
+                    vk::Offset3D::default().x(src_w as i32).y(src_h as i32).z(1),
+                ])
+                .dst_subresource(vk::ImageSubresourceLayers::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_array_layer(0)
+                    .layer_count(1)
+                    .mip_level(0))
+                .dst_offsets([
+                    vk::Offset3D::default().x(0).y(0).z(0),
+                    vk::Offset3D::default().x(dst_w as i32).y(dst_h as i32).z(1),
+                ])
+        ];
+
+        list.init_image(swap_image.vk_image, &subresource)?;
+        list.blit_image(swap_image.vk_image, image.vk_image, &region)?;
+        list.present_image(swap_image.vk_image, &subresource)?;
+
+        self.submit()?;
+
+        if let Err(e) = self.swapchain.as_mut().unwrap().present() {
+            eprintln!("Presentation failed: {e}");
+            mem::drop(self.swapchain.take());
+        }
+        
+        Ok(())
     }
 }
 

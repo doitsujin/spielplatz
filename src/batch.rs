@@ -1265,6 +1265,7 @@ pub struct BatchInstance {
     inputs          : HashMap<String, Box<dyn InputResource>>,
     outputs         : HashMap<String, Box<dyn OutputResource>>,
     pass_instances  : Vec<PassInstance>,
+    resource_map    : HashMap<String, Binding>,
 }
 
 impl BatchInstance {
@@ -1285,6 +1286,13 @@ impl BatchInstance {
         }
 
         Ok(())
+    }
+    
+    pub fn get_output_image(&self, name : &str) -> Option<Rc<Image>> {
+        match self.resource_map.get(name) {
+            Some(Binding::Image(image)) => Some(image.clone()),
+            _ => None
+        }
     }
 }
 
@@ -1316,6 +1324,8 @@ impl BatchInstance {
 
         // Map output resources to batch outputs
         instance.create_outputs(base_path, context, &resource_map, batch)?;
+        instance.resource_map = resource_map.into_iter().map(
+            |(k, (_, _, v))| (k, v)).collect();
 
         Ok(instance)
     }
