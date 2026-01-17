@@ -2,7 +2,6 @@ use std::collections::{HashMap};
 use std::cell::{RefCell};
 use std::cmp;
 use std::ffi::{CStr, CString, c_char, c_void};
-use std::marker::{PhantomData};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
@@ -31,6 +30,16 @@ fn make_cstring_from_vk<const N : usize>(s : &[c_char; N]) -> CString {
     }
 
     CStr::from_bytes_until_nul(&bytes).unwrap().into()
+}
+
+
+// Interactive UI action
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Action {
+    Quit,
+    Continue,
+    NextBatch,
+    PrevBatch,
 }
 
 
@@ -275,10 +284,9 @@ struct Properties {
 
 // Reference-counted SDL subsystem
 struct SdlInstance {
-    _instance   : sdl3::Sdl,
+    instance    : sdl3::Sdl,
     video       : sdl3::VideoSubsystem,
     event       : sdl3::EventSubsystem,
-    event_pump  : sdl3::EventPump,
     // yes i know this design is bad but i really don't care
     // right now, i just want to be able to resize the window
     window      : RefCell<sdl3::video::Window>,
@@ -302,10 +310,9 @@ impl SdlInstance {
             .map_err(|e| e.to_string())?;
 
         Ok(Self {
-            _instance   : instance,
+            instance    : instance,
             video       : video,
             event       : event,
-            event_pump  : event_pump,
             window      : RefCell::new(window),
         })
     }
@@ -345,6 +352,30 @@ impl SdlInstance {
 
     fn show_window(&self) {
         self.window.borrow_mut().show();
+    }
+
+    fn process_events(&self) -> Action {
+        let mut event_pump = self.instance.event_pump().unwrap();
+
+        for event in event_pump.poll_iter() {
+            use sdl3::event::Event;
+
+            match event {
+                Event::Quit { .. } => { return Action::Quit; },
+
+                Event::KeyDown { keycode : Some(k), .. } => {
+                    match k {
+                        sdl3::keyboard::Keycode::Right => { return Action::NextBatch; },
+                        sdl3::keyboard::Keycode::Left  => { return Action::PrevBatch; },
+                        _ => { }
+                    }
+                },
+
+                _ => { }
+            }
+        }
+
+        Action::Continue
     }
 }
 
@@ -2685,7 +2716,7 @@ impl Context {
     }
 
     // Displays given image on the application window.
-    pub fn display(&mut self, image : &Rc<Image>) -> Result<(), String> {
+    pub fn display(&mut self, image : &Rc<Image>) -> Result<Action, String> {
         if self.swapchain.is_none() {
             self.device.instance.sdl.show_window();
             self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
@@ -2753,7 +2784,7 @@ impl Context {
             mem::drop(self.swapchain.take());
         }
         
-        Ok(())
+        Ok(self.device.instance.sdl.process_events())
     }
 }
 
