@@ -40,6 +40,7 @@ pub enum Action {
     Continue,
     NextBatch,
     PrevBatch,
+    Resize,
 }
 
 
@@ -288,7 +289,7 @@ struct SdlInstance {
     video       : sdl3::VideoSubsystem,
     event       : sdl3::EventSubsystem,
     // yes i know this design is bad but i really don't care
-    // right now, i just want to be able to resize the window
+    // right now, i just want to be able to show the window
     window      : RefCell<sdl3::video::Window>,
 }
 
@@ -306,6 +307,7 @@ impl SdlInstance {
             .high_pixel_density()
             .vulkan()
             .hidden()
+            .resizable()
             .build()
             .map_err(|e| e.to_string())?;
 
@@ -358,7 +360,7 @@ impl SdlInstance {
         let mut event_pump = self.instance.event_pump().unwrap();
 
         for event in event_pump.poll_iter() {
-            use sdl3::event::Event;
+            use sdl3::event::{Event, WindowEvent};
 
             match event {
                 Event::Quit { .. } => { return Action::Quit; },
@@ -369,6 +371,10 @@ impl SdlInstance {
                         sdl3::keyboard::Keycode::Left  => { return Action::PrevBatch; },
                         _ => { }
                     }
+                },
+
+                Event::Window { win_event : WindowEvent::PixelSizeChanged(_, _), .. } => {
+                    return Action::Resize
                 },
 
                 _ => { }
@@ -2722,16 +2728,17 @@ impl Context {
             self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
         }
 
-        let swap_image = match self.swapchain.as_mut().unwrap().acquire() {
-            Ok(image) => Ok(image),
-            Err(_) => {
-                // Try and recreate swapchain first, then reacquire
-                mem::drop(self.swapchain.take());
-                
-                self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
-                self.swapchain.as_mut().unwrap().acquire()
+        let swap_image = loop {
+            match self.swapchain.as_mut().unwrap().acquire() {
+                Ok(image) => break image,
+                Err(_) => {
+                    // Recreate swapchain
+                    mem::drop(self.swapchain.take());
+
+                    self.swapchain = Some(VulkanSwapchain::new(&self.device)?);
+                }
             }
-        }?;
+        };
 
         let list = &mut self.lists[self.list_index];
 
@@ -2751,6 +2758,18 @@ impl Context {
         let (src_w, src_h, _) = image.info().extent;
         let (dst_w, dst_h) = swap_image.image_extent;
 
+        let scale = f32::min(
+            (dst_w as f32) / (src_w as f32),
+            (dst_h as f32) / (src_h as f32));
+
+        let scaled_w = (src_w as f32 * scale) as i32;
+        let scaled_h = (src_h as f32 * scale) as i32;
+
+        let scaled_l = (dst_w as i32 - scaled_w) / 2;
+        let scaled_t = (dst_h as i32 - scaled_h) / 2;
+        let scaled_r = scaled_l + scaled_w;
+        let scaled_b = scaled_t + scaled_h;
+
         let region = [
             vk::ImageBlit::default()
                 .src_subresource(vk::ImageSubresourceLayers::default()
@@ -2768,8 +2787,8 @@ impl Context {
                     .layer_count(1)
                     .mip_level(0))
                 .dst_offsets([
-                    vk::Offset3D::default().x(0).y(0).z(0),
-                    vk::Offset3D::default().x(dst_w as i32).y(dst_h as i32).z(1),
+                    vk::Offset3D::default().x(scaled_l).y(scaled_t).z(0),
+                    vk::Offset3D::default().x(scaled_r).y(scaled_b).z(1),
                 ])
         ];
 
@@ -2784,7 +2803,13 @@ impl Context {
             mem::drop(self.swapchain.take());
         }
         
-        Ok(self.device.instance.sdl.process_events())
+        let action = self.device.instance.sdl.process_events();
+
+        if action == Action::Resize {
+            mem::drop(self.swapchain.take());
+        }
+
+        Ok(action)
     }
 }
 

@@ -115,7 +115,7 @@ fn run_interactive_mode(
                 batch_index = (batch_index + batches.len() - 1) % batches.len();
             },
 
-            Action::Continue => { },
+            _ => { },
         }
     }
 
