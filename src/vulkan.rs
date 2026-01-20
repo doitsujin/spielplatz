@@ -1128,6 +1128,19 @@ impl Drop for PipelineBindings {
 }
 
 
+#[derive(Debug, Default, Clone)]
+pub struct PipelineArgs {
+    subgroup_size : Option<u32>,
+}
+
+impl PipelineArgs {
+    pub fn subgroup_size(mut self, v : Option<u32>) -> Self {
+        self.subgroup_size = v;
+        self
+    }
+}
+
+
 // Vulkan compute shader pipeline
 pub struct Pipeline {
     device            : Rc<VulkanDevice>,
@@ -1138,7 +1151,7 @@ pub struct Pipeline {
 }
 
 impl Pipeline {
-    pub fn new(context : &Context, shader : Shader) -> Result<Rc<Self>, String> {
+    pub fn new(context : &Context, shader : Shader, args : &PipelineArgs) -> Result<Rc<Self>, String> {
         let vk = context.device.get();
 
         let set_count = shader.resources().iter().fold(0,
@@ -1158,7 +1171,7 @@ impl Pipeline {
         let vk_pipeline_layout = Self::create_pipeline_layout(
                 vk, &set_layouts, shader.push_constants())?;
 
-        let vk_pipeline = Self::create_pipeline(vk, shader.code(), vk_pipeline_layout).map_err(|e| {
+        let vk_pipeline = Self::create_pipeline(vk, shader.code(), vk_pipeline_layout, args).map_err(|e| {
             unsafe { vk.destroy_pipeline_layout(vk_pipeline_layout, None); }
             e
         })?;
@@ -1206,14 +1219,26 @@ impl Pipeline {
         Ok(vk_pipeline_layout)
     }
 
-    fn create_pipeline(vk : &ash::Device, code : &[u32], layout : vk::PipelineLayout) -> Result<vk::Pipeline, String> {
+    fn create_pipeline(
+        vk      : &ash::Device,
+        code    : &[u32],
+        layout  : vk::PipelineLayout,
+        args    : &PipelineArgs
+    ) -> Result<vk::Pipeline, String> {
         let mut module_info = vk::ShaderModuleCreateInfo::default()
             .code(&code);
 
-        let stage_info = vk::PipelineShaderStageCreateInfo::default()
+        let mut stage_info = vk::PipelineShaderStageCreateInfo::default()
             .push_next(&mut module_info)
             .stage(vk::ShaderStageFlags::COMPUTE)
             .name(c"main");
+
+        let mut subgroup_size_info = vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo::default();
+
+        if let Some(subgroup_size) = args.subgroup_size {
+            subgroup_size_info = subgroup_size_info.required_subgroup_size(subgroup_size);
+            stage_info = stage_info.push_next(&mut subgroup_size_info);
+        }
 
         let info = [
             vk::ComputePipelineCreateInfo::default()

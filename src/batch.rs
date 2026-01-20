@@ -665,6 +665,7 @@ struct ShaderInfo {
     name          : String,
     file          : String,
     dispatch      : ShaderDispatch,
+    subgroup_size : Option<u32>,
     default_args  : ShaderArgs,
     outputs       : HashMap<String, OutputResourceInfo>,
 }
@@ -694,10 +695,19 @@ impl ParseArray for ShaderInfo {
             .iter().map(|v| OutputResourceInfo::parse(v))
             .collect::<Result<HashMap<_, _>, String>>()?;
 
+        let subgroup_size = val.get("subgroup_size")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as u32);
+
+        if let Some(v) = subgroup_size && !v.is_power_of_two() {
+            return Err(format!("Subgroup size {v} not a power of two"));
+        }
+
         Ok(Self {
             name          : name.clone(),
             file          : file.clone(),
             dispatch      : dispatch_info,
+            subgroup_size : subgroup_size,
             default_args  : args,
             outputs       : outputs,
         })
@@ -835,9 +845,12 @@ impl BatchFile {
         Ok(ShaderSet::new(self.shaders.iter().map(|(name, info)| {
             let path = base_path.join(&info.file);
             println!("Loading shader: {}", path.to_str().unwrap());
+            
+            let args = PipelineArgs::default()
+                .subgroup_size(info.subgroup_size);
 
             let shader = Shader::from_file(&path)?;
-            Ok((name.clone(), Pipeline::new(context, shader)?))
+            Ok((name.clone(), Pipeline::new(context, shader, &args)?))
         }).collect::<Result<_, String>>()?))
     }
 
