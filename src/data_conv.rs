@@ -303,6 +303,11 @@ fn decode_bytes<const N : usize>(src : &[u8]) -> Result<[u8; N], String> {
     }
 }
 
+fn to_json_float_value(val : Option<sj::Number>) -> sj::Value {
+    val.map(|n| sj::Value::Number(n))
+        .unwrap_or_else(|| sj::Value::String("nan".into()))
+}
+
 fn to_json_scalar(src : &[u8], ty : ScalarType) -> Result<sj::Value, String> {
     if src.len() < ty.size() {
         return Err(format!("Type {:?} requires {} bytes, got {}", ty, ty.size(), src.len()))
@@ -354,17 +359,17 @@ fn to_json_scalar(src : &[u8], ty : ScalarType) -> Result<sj::Value, String> {
 
         ScalarType::Float16 => {
             let v = decode_bytes::<2>(src)?;
-            sj::Value::Number(sj::Number::from_f64(f16_to_f32(u16::from_le_bytes(v)) as f64).unwrap())
+            to_json_float_value(sj::Number::from_f64(f16_to_f32(u16::from_le_bytes(v)) as f64))
         },
 
         ScalarType::Float32 => {
             let v = decode_bytes::<4>(src)?;
-            sj::Value::Number(sj::Number::from_f64(f32::from_le_bytes(v) as f64).unwrap())
+            to_json_float_value(sj::Number::from_f64(f32::from_le_bytes(v) as f64))
         },
 
         ScalarType::Float64 => {
             let v = decode_bytes::<8>(src)?;
-            sj::Value::Number(sj::Number::from_f64(f64::from_le_bytes(v)).unwrap())
+            to_json_float_value(sj::Number::from_f64(f64::from_le_bytes(v)))
         },
     };
 
