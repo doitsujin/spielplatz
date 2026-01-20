@@ -2,7 +2,7 @@ use std::collections::{HashMap};
 use std::cmp::{self, Ord, Ordering, PartialOrd};
 use std::fs;
 use std::ops::{Deref};
-use std::path::{Path};
+use std::path::{Path, PathBuf};
 
 use glslang;
 
@@ -433,6 +433,40 @@ impl DataType {
 }
 
 
+// Shader include handler
+pub struct IncludeHandler {
+    base_path : PathBuf,
+}
+
+impl IncludeHandler {
+    fn new(base_path : &Path) -> Self {
+        Self {
+            base_path : base_path.into()
+        }
+    }
+}
+
+impl glslang::include::IncludeHandler for IncludeHandler {
+    fn include(&mut self,
+        _ty             : glslang::include::IncludeType,
+        header_name     : &str,
+        includer_name   : &str,
+        _include_depth  : usize,
+    ) -> Option<glslang::include::IncludeResult> {
+        let path = self.base_path.join(header_name);
+
+        let file = fs::read_to_string(&path)
+            .map_err(|e| { println!("Failed to load include {}: {e}", path.to_str().unwrap()) })
+            .ok()?;
+
+        Some(glslang::include::IncludeResult {
+            name : header_name.into(),
+            data : file
+        })
+    }
+}
+
+
 // Shader object
 pub struct Shader {
     code        : Vec<u32>,
@@ -547,13 +581,16 @@ impl Shader {
 
     // Load and compile GLSL source file using reasonable set of default options.
     pub fn from_glsl_file(filename : &Path) -> Result<Self, String> {
+        let include_path = filename.parent().ok_or(
+            format!("Failed to get include path for {}", filename.to_str().unwrap()))?;
+
         let source = fs::read_to_string(filename).map_err(
             |e| format!("Failed to read {}:\n{}.", filename.to_str().unwrap(), e.to_string()))?;
 
         let compiler = glslang::Compiler::acquire()
             .ok_or("Failed to acquire glslang instance.")?;
 
-        let code = Self::compile_glsl(&compiler, source).map_err(
+        let code = Self::compile_glsl(&compiler, source, include_path).map_err(
             |e| format!("Failed to compile {}:\n{}", filename.to_str().unwrap(), e.to_string()))?;
 
         Self::from_spv(code)
@@ -561,7 +598,7 @@ impl Shader {
 }
 
 impl Shader {
-    fn compile_glsl(compiler : &glslang::Compiler, glsl : String) -> Result<Vec<u32>, glslang::error::GlslangError> {
+    fn compile_glsl(compiler : &glslang::Compiler, glsl : String, include_path : &Path) -> Result<Vec<u32>, glslang::error::GlslangError> {
         let source = glslang::ShaderSource::from(glsl);
 
         let mut options = glslang::CompilerOptions::default();
@@ -570,10 +607,13 @@ impl Shader {
             spirv_version : glslang::SpirvVersion::SPIRV1_6,
         };
 
+        let mut include_handler = IncludeHandler::new(include_path);
+
         let input = glslang::ShaderInput::new(&source,
             glslang::ShaderStage::Compute,
             &options,
-            None, None)?;
+            None,
+            Some(&mut include_handler))?;
 
         let shader = compiler.create_shader(input)?;
         shader.compile()
