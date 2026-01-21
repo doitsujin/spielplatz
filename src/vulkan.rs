@@ -213,8 +213,9 @@ impl VulkanInfo {
 // Enabled or supported Vulkan extensions
 #[derive(Debug, Default)]
 struct Extensions {
-    khr_swapchain     : bool,
-    khr_maintenance5  : bool,
+    khr_swapchain           : bool,
+    khr_cooperative_matrix  : bool,
+    khr_maintenance5        : bool,
 }
 
 impl Extensions {
@@ -245,8 +246,9 @@ impl Extensions {
 
     fn get_mapping<'a>(&'a mut self) -> Vec<(&'static CStr, &'a mut bool)> {
         vec![
-            (khr::swapchain::NAME,    &mut self.khr_swapchain),
-            (khr::maintenance5::NAME, &mut self.khr_maintenance5),
+            (khr::swapchain::NAME,          &mut self.khr_swapchain),
+            (khr::cooperative_matrix::NAME, &mut self.khr_cooperative_matrix),
+            (khr::maintenance5::NAME,       &mut self.khr_maintenance5),
         ]
     }
 }
@@ -255,11 +257,12 @@ impl Extensions {
 // Enabled or supported device features
 #[derive(Debug, Default, Clone)]
 struct Features<'a> {
-    core              : vk::PhysicalDeviceFeatures2<'a>,
-    vk11              : vk::PhysicalDeviceVulkan11Features<'a>,
-    vk12              : vk::PhysicalDeviceVulkan12Features<'a>,
-    vk13              : vk::PhysicalDeviceVulkan13Features<'a>,
-    khr_maintenance5  : vk::PhysicalDeviceMaintenance5FeaturesKHR<'a>,
+    core                    : vk::PhysicalDeviceFeatures2<'a>,
+    vk11                    : vk::PhysicalDeviceVulkan11Features<'a>,
+    vk12                    : vk::PhysicalDeviceVulkan12Features<'a>,
+    vk13                    : vk::PhysicalDeviceVulkan13Features<'a>,
+    khr_cooperative_matrix  : vk::PhysicalDeviceCooperativeMatrixFeaturesKHR<'a>,
+    khr_maintenance5        : vk::PhysicalDeviceMaintenance5FeaturesKHR<'a>,
 }
 
 macro_rules! copy_members {
@@ -628,6 +631,7 @@ impl VulkanDevice {
             .push_next(&mut supported_features.vk11)
             .push_next(&mut supported_features.vk12)
             .push_next(&mut supported_features.vk13)
+            .push_next(&mut supported_features.khr_cooperative_matrix)
             .push_next(&mut supported_features.khr_maintenance5);
 
         let mut core_properties = vk::PhysicalDeviceProperties2::default()
@@ -709,6 +713,10 @@ impl VulkanDevice {
             maintenance4,
         ]);
 
+        copy_members!(&mut features.khr_cooperative_matrix, &supported_features.khr_cooperative_matrix, [
+            cooperative_matrix,
+        ]);
+
         copy_members!(&mut features.khr_maintenance5, &supported_features.khr_maintenance5, [
             maintenance5,
         ]);
@@ -720,6 +728,7 @@ impl VulkanDevice {
             .push_next(&mut enabled_features.vk11)
             .push_next(&mut enabled_features.vk12)
             .push_next(&mut enabled_features.vk13)
+            .push_next(&mut enabled_features.khr_cooperative_matrix)
             .push_next(&mut enabled_features.khr_maintenance5);
 
         // Copy known properties
