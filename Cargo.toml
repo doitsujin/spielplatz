@@ -9,6 +9,6 @@ bitflags = "2.10.0"
 clap = { version = "4.5.54", features = ["derive"] }
 glslang = "0.6.2"
 png = "0.18.0"
-rspirv = "0.12.0"
+rspirv = { git = "https://github.com/gfx-rs/rspirv.git", rev = "3e8814d838a49a98084ada2d1a8677e3281c6d33" }
 sdl3 = "0.17.3"
 serde_json = "1.0.149"
