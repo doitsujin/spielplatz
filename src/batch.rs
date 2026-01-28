@@ -872,6 +872,11 @@ impl BatchFile {
     pub fn list_batches(&self) -> Vec<String> {
         self.batches.iter().map(|(name, _)| name.clone()).collect()
     }
+
+    // Pass names
+    pub fn enum_passes(&self) -> Vec<String> {
+        self.passes.iter().map(|p| p.shader.clone()).collect()
+    }
 }
 
 
@@ -1261,7 +1266,7 @@ struct PassInstance {
 }
 
 impl PassInstance {
-    pub fn dispatch(&self, context : &mut Context) -> Result<(), String> {
+    pub fn dispatch(&self, context : &mut Context) -> Result<DispatchInfo, String> {
         context.dispatch(
             &self.pipeline,
             self.workgroups,
@@ -1282,9 +1287,8 @@ pub struct BatchInstance {
 }
 
 impl BatchInstance {
-    pub fn dispatch(&self, context : &mut Context) -> Result<(), String> {
-        self.pass_instances.iter().fold(Ok(()),
-            |accum, pass| accum.and_then(|_| pass.dispatch(context)))
+    pub fn dispatch(&self, context : &mut Context) -> Result<Vec<DispatchInfo>, String> {
+        self.pass_instances.iter().map(|pass| pass.dispatch(context)).collect()
     }
 
     pub fn store_outputs(&self, context : &mut Context) -> Result<(), String> {
@@ -1494,6 +1498,7 @@ impl BatchInstance {
             OutputResourceInfo::Buffer(info) => {
                 let buf_info = info.eval(shader, resources)?;
                 let buffer = Buffer::new(context, buf_info)?;
+                context.init_buffer(&buffer)?;
 
                 Ok(Binding::Buffer(buffer))
             },

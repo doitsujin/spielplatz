@@ -1,5 +1,7 @@
 use std::env;
+use std::iter::{Iterator};
 use std::mem;
+use std::num;
 use std::path::{Path};
 
 use clap::{Parser};
@@ -28,9 +30,33 @@ struct CliArgs {
     #[arg(long, value_name = "index")]
     adapter : Option<u32>,
 
+    #[arg(long, value_name = "iterations")]
+    benchmark : Option<u32>,
+
     #[arg(long)]
     debug : bool,
 }
+
+
+fn compute_mean<'a>(i : impl Iterator<Item = &'a DispatchInfo>) -> Option<(f64, u32)> {
+    let data_points = i.map(|e| e.compute_duration_us()).collect::<Option<Vec<_>>>()?;
+    let n = data_points.len() as f64;
+
+    /* Compute mean and standard deviation */
+    let mean = data_points.iter().fold(0.0, |a, b| a + b) / n;
+    let var = data_points.iter().fold(0.0, |a, b| a + (b - mean) * (b - mean)) / n;
+
+    /* Discard values that lie outside the three sigma window */
+    let data_points = data_points.into_iter()
+        .filter(|a| (a - mean) * (a - mean) <= (9.0 * var))
+        .collect::<Vec<_>>();
+
+    let n = data_points.len() as f64;
+    let mean = data_points.iter().fold(0.0, |a, b| a + b / n);
+
+    Some((mean, data_points.len() as u32))
+}
+
 
 fn run_batch_mode(
     args        : &CliArgs,
@@ -39,6 +65,7 @@ fn run_batch_mode(
     base_path   : &Path
 ) -> Result<(), String> {
     let shaders = batch_file.load_shaders(&base_path, &vulkan)?;
+    let passes = batch_file.enum_passes();
 
     let mut found_batch = false;
 
@@ -55,6 +82,30 @@ fn run_batch_mode(
 
         instance.dispatch(&mut vulkan)?;
         instance.store_outputs(&mut vulkan)?;
+
+        if let Some(iter) = args.benchmark {
+            let mut dispatches : Vec<Vec<DispatchInfo>> = vec![];
+            let mut sync_point = None::<SyncPoint>;
+
+            for i in 0..iter {
+                dispatches.push(instance.dispatch(&mut vulkan)?);
+                sync_point = Some(vulkan.submit()?);
+            }
+
+            if let Some(sync) = sync_point {
+                sync.wait()?;
+
+                println!("Benchmark for batch '{}':", batch);
+
+                for (index, pass) in passes.iter().enumerate() {
+                    let iter = dispatches.iter().map(|e| &e[index]);
+
+                    if let Some((mean, cnt)) = compute_mean(iter) {
+                        println!("{} - {}: {:.1} us ({} entries)", index, pass, mean, cnt);
+                    }
+                }
+            }
+        }
 
         found_batch = true;
     }

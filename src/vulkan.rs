@@ -1,5 +1,5 @@
 use std::collections::{HashMap};
-use std::cell::{RefCell};
+use std::cell::{Cell, RefCell};
 use std::cmp;
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::mem;
@@ -596,7 +596,7 @@ impl Drop for VulkanInstance {
 // Reference-counted Vulkan device
 struct VulkanDevice {
     instance      : VulkanInstance,
-    _properties    : Properties,
+    properties    : Properties,
     _features      : Features<'static>,
     adapter       : vk::PhysicalDevice,
     memory        : vk::PhysicalDeviceMemoryProperties,
@@ -821,7 +821,7 @@ impl VulkanDevice {
         Ok(Self {
             instance      : instance,
             _features     : features,
-            _properties   : properties,
+            properties    : properties,
             adapter       : adapter,
             memory        : memory,
             queue_family  : queue_index,
@@ -1926,6 +1926,30 @@ impl CommandList {
         Ok(())
     }
 
+    // Initializes output buffer
+    fn init_buffer(&mut self, buffer : vk::Buffer, offset : usize, size : usize) -> Result<(), String> {
+        let cmd = self.begin()?;
+
+        let stage_mask = 
+            vk::PipelineStageFlags2::COPY;
+
+        let access_mask =
+            vk::AccessFlags2::TRANSFER_WRITE;
+
+        self.state.sync_stages |= stage_mask;
+        self.state.sync_access |= access_mask;
+
+        let vk = self.device.get();
+
+        unsafe {
+            vk.cmd_fill_buffer(cmd, buffer,
+                offset as vk::DeviceSize,
+                size as vk::DeviceSize, 0);
+        }
+
+        Ok(())
+    }
+
     // Initializes output image
     fn init_image(&mut self, image : vk::Image, subresources : &vk::ImageSubresourceRange) -> Result<(), String> {
         let cmd = self.begin()?;
@@ -2155,13 +2179,15 @@ impl CommandList {
     }
 
     // Dispatches bound compute pipeline
-    fn dispatch(&mut self, workgroups : (u32, u32, u32)) -> Result<(), String> {
+    fn dispatch(&mut self, workgroups : (u32, u32, u32), before : &QueryHandle, after : &QueryHandle) -> Result<(), String> {
         self.emit_barrier(
             vk::PipelineStageFlags2::COMPUTE_SHADER,
             vk::AccessFlags2::UNIFORM_READ |
             vk::AccessFlags2::SHADER_SAMPLED_READ |
             vk::AccessFlags2::SHADER_STORAGE_READ |
             vk::AccessFlags2::SHADER_STORAGE_WRITE)?;
+
+        self.write_timestamp(before.pool.vk_pool, before.index)?;
 
         let cmd = self.begin()?;
         let vk = self.device.get();
@@ -2171,6 +2197,7 @@ impl CommandList {
             vk.cmd_dispatch(cmd, x, y, z);
         }
 
+        self.write_timestamp(after.pool.vk_pool, after.index)?;
         Ok(())
     }
 
@@ -2336,6 +2363,30 @@ impl CommandList {
             vk.update_descriptor_sets(&writes, &[]);
         }
     }
+
+    // Resets a query pool
+    fn reset_queries(&mut self, pool : vk::QueryPool, index : u32, count : u32) -> Result<(), String> {
+        let cmd = self.begin()?;
+        let vk = self.device.get();
+
+        unsafe {
+            vk.cmd_reset_query_pool(cmd, pool, index, count);
+        }
+
+        Ok(())
+    }
+
+    // Writes a timestamp query
+    fn write_timestamp(&mut self, pool : vk::QueryPool, index : u32) -> Result<(), String> {
+        let cmd = self.begin()?;
+        let vk = self.device.get();
+
+        unsafe {
+            vk.cmd_write_timestamp(cmd, vk::PipelineStageFlags::ALL_COMMANDS, pool, index);
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for CommandList {
@@ -2433,6 +2484,143 @@ impl<'a> SyncPoint<'a> {
 }
 
 
+// Query pool. Sort-of ring buffer thing that keeps
+// track of when each query was submitted and 
+// and recycles the underlying pool if possbible.
+struct QueryPool {
+    device        : Rc<VulkanDevice>,
+    vk_pool       : vk::QueryPool,
+
+    used_queries  : Cell<u32>,
+    next_index    : Cell<u32>,
+    size          : u32,
+    gpu_timeline  : u64,
+}
+
+impl QueryPool {
+    fn new(device : Rc<VulkanDevice>) -> Result<Self, String> {
+        let info = vk::QueryPoolCreateInfo::default()
+            .query_type(vk::QueryType::TIMESTAMP)
+            .query_count(4096);
+
+        let vk = device.get();
+
+        let vk_pool = unsafe {
+            vk.create_query_pool(&info, None).map_err(
+                |e| format!("Failed to create query pool: {e}"))?
+        };
+
+        Ok(Self {
+            device        : device,
+            vk_pool       : vk_pool,
+            used_queries  : Cell::new(0),
+            next_index    : Cell::new(0),
+            size          : info.query_count,
+            gpu_timeline  : 0,
+        })
+    }
+
+    fn alloc_handle(&self) -> Option<u32> {
+        let index = self.next_index.get();
+
+        if index == self.size {
+            return None;
+        }
+
+        self.next_index.set(index + 1);
+        Some(index)
+    }
+
+    fn track_handle(&self) {
+        self.used_queries.set(self.used_queries.get() + 1);
+    }
+
+    fn drop_handle(&self) {
+        self.used_queries.set(self.used_queries.get() - 1);
+    }
+
+    fn reset(&self) -> bool {
+        match self.used_queries.get() {
+            0 => {
+                self.next_index.set(0);
+                true
+            },
+            _ => false
+        }
+    }
+}
+
+impl Drop for QueryPool {
+    fn drop(&mut self) {
+        let vk = self.device.get();
+
+        unsafe {
+            vk.destroy_query_pool(self.vk_pool, None);
+        }
+    }
+}
+
+
+// Query handle
+struct QueryHandle {
+    pool        : Rc<QueryPool>,
+    index       : u32,
+}
+
+impl QueryHandle {
+    fn new(pool : Rc<QueryPool>, index : u32) -> Self {
+        pool.track_handle();
+
+        Self {
+            pool  : pool,
+            index : index,
+        }
+    }
+}
+
+impl Drop for QueryHandle {
+    fn drop(&mut self) {
+        self.pool.drop_handle();
+    }
+}
+
+
+// Dispatch result
+pub struct DispatchInfo {
+    device      : Rc<VulkanDevice>,
+    time_before : QueryHandle,
+    time_after  : QueryHandle,
+}
+
+impl DispatchInfo {
+    pub fn compute_duration_us(&self) -> Option<f64> {
+        let ns_per_tick = self.device.properties.core.properties.limits.timestamp_period;
+        let us_per_tick = (ns_per_tick as f64) / 1000.0;
+
+        let vk = self.device.get();
+
+        let mut a = [0u64];
+        let mut b = [0u64];
+
+        let (start, end) = unsafe {
+            (vk.get_query_pool_results(self.time_before.pool.vk_pool,
+                self.time_before.index, &mut a, vk::QueryResultFlags::TYPE_64),
+             vk.get_query_pool_results(self.time_after.pool.vk_pool,
+                self.time_after.index, &mut b, vk::QueryResultFlags::TYPE_64))
+        };
+
+        if !start.is_ok() || !end.is_ok() {
+            return None;
+        }
+
+        let a_us = (a[0] as f64) * us_per_tick;
+        let b_us = (b[0] as f64) * us_per_tick;
+
+        Some((b_us - a_us) as f64)
+    }
+}
+
+
 // Vulkan context
 pub struct Context {
     device      : Rc<VulkanDevice>,
@@ -2440,6 +2628,9 @@ pub struct Context {
 
     lists       : Vec<CommandList>,
     list_index  : usize,
+
+    query_pools : Vec<Rc<QueryPool>>,
+    query_pool  : Option<Rc<QueryPool>>,
     
     swapchain   : Option<VulkanSwapchain>,
 }
@@ -2459,6 +2650,8 @@ impl Context {
             timeline    : timeline,
             lists       : command_lists,
             list_index  : 0,
+            query_pools : Vec::new(),
+            query_pool  : None,
             swapchain   : None,
         })
     }
@@ -2481,6 +2674,16 @@ impl Context {
         list.reset(&self.timeline)?;
 
         Ok(sync_point)
+    }
+
+    // Initialize and clear buffer
+    pub fn init_buffer(&mut self,
+        dst_buffer : &Rc<Buffer>
+    ) -> Result<(), String> {
+        let list = self.get_list();
+
+        list.track(dst_buffer);
+        list.init_buffer(dst_buffer.vk_buffer, 0, dst_buffer.info.size)
     }
 
     // Initializes image
@@ -2615,7 +2818,10 @@ impl Context {
         workgroups      : (u32, u32, u32),
         shader_args     : &sj::Value,
         shader_bindings : &HashMap<String, Binding>,
-    ) -> Result<(), String> {
+    ) -> Result<DispatchInfo, String> {
+        let before = self.alloc_query()?;
+        let after = self.alloc_query()?;
+
         let list = self.get_list();
 
         // Track and bind shader
@@ -2752,7 +2958,13 @@ impl Context {
             list.set_push_data(pipeline, &arg_data)?;
         }
 
-        list.dispatch(workgroups)
+        list.dispatch(workgroups, &before, &after)?;
+
+        Ok(DispatchInfo {
+            device      : self.device.clone(),
+            time_before : before,
+            time_after  : after,
+        })
     }
 
     // Displays given image on the application window.
@@ -2850,6 +3062,37 @@ impl Context {
 impl Context {
     fn get_list<'a>(&'a mut self) -> &'a mut CommandList {
         &mut self.lists[self.list_index]
+    }
+
+    fn alloc_query(&mut self) -> Result<QueryHandle, String> {
+        let index = self.query_pool.as_ref().and_then(|p| p.alloc_handle());
+
+        if let Some(index) = index {
+            return Ok(QueryHandle::new(self.query_pool.clone().unwrap(), index));
+        }
+
+        let pool = self.alloc_query_pool()?;
+        self.query_pool = Some(pool.clone());
+        let index = pool.alloc_handle().unwrap();
+
+        Ok(QueryHandle::new(pool, index))
+    }
+
+    fn alloc_query_pool(&mut self) -> Result<Rc<QueryPool>, String> {
+        let pool = self.query_pools.iter()
+            .filter(|p| p.reset())
+            .cloned()
+            .next();
+
+        let pool = match pool {
+            Some(p) => p,
+            _       => Rc::new(QueryPool::new(self.device.clone())?),
+        };
+
+        let list = self.get_list();
+        list.reset_queries(pool.vk_pool, 0, pool.size)?;
+
+        Ok(pool)
     }
 }
 
