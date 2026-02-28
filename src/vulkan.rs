@@ -3092,6 +3092,8 @@ impl Context {
         let list = self.get_list();
         list.reset_queries(pool.vk_pool, 0, pool.size)?;
 
+        self.query_pools.push(pool.clone());
+
         Ok(pool)
     }
 }
