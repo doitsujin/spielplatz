@@ -82,6 +82,8 @@ enum NumericSource {
     Mul(Box<NumericSource>, Box<NumericSource>),
     // Divides two numbers
     Div(Box<NumericSource>, Box<NumericSource>),
+    // Divides two numbers and rounds up
+    DivUp(Box<NumericSource>, Box<NumericSource>),
     // Minimum of two numbers
     Min(Box<NumericSource>, Box<NumericSource>),
     // Maximum of two numbers
@@ -154,6 +156,13 @@ impl NumericSource {
             if let Some(sj::Value::Array(components)) = o.get("div") &&
                     let [a, b] = &components[..] {
                 return Ok(Self::Div(
+                    Box::new(Self::parse(a)?),
+                    Box::new(Self::parse(b)?)));
+            }
+
+            if let Some(sj::Value::Array(components)) = o.get("div_up") &&
+                    let [a, b] = &components[..] {
+                return Ok(Self::DivUp(
                     Box::new(Self::parse(a)?),
                     Box::new(Self::parse(b)?)));
             }
@@ -291,6 +300,12 @@ impl NumericSource {
 
             NumericSource::Div(a, b) => {
                 Ok(a.eval(shader, resources)? / b.eval(shader, resources)?)
+            },
+
+            NumericSource::DivUp(a, b) => {
+                let a_val = a.eval(shader, resources)?;
+                let b_val = b.eval(shader, resources)?;
+                Ok((a_val + b_val - 1) / b_val)
             },
 
             NumericSource::Max(a, b) => {
